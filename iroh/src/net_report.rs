@@ -855,7 +855,11 @@ async fn run_probe_v4(
         latency: conn.rtt(PathId::ZERO).unwrap_or_default(),
     };
 
-    let observer = Watchable::new(None);
+    // Seeded with the first report: `QadConns::current_v4` answers later
+    // net reports from the observer alone, and one that finds it empty
+    // probes the relay again, opening a connection on every run until the
+    // observed address changes.
+    let observer = Watchable::new(Some(report.clone()));
     let endpoint = relay.url.clone();
     let handle = task::spawn(shutdown_token.run_until_cancelled_owned({
         let conn = conn.clone();
@@ -921,7 +925,8 @@ async fn run_probe_v6(
         latency: conn.rtt(PathId::ZERO).unwrap_or_default(),
     };
 
-    let observer = Watchable::new(None);
+    // Seeded with the first report, as in `run_probe_v4`.
+    let observer = Watchable::new(Some(report.clone()));
     let endpoint = relay.url.clone();
     let handle = task::spawn(shutdown_token.run_until_cancelled_owned({
         let observer = observer.clone();
@@ -1160,6 +1165,52 @@ mod tests {
             assert!(r.preferred_relay.is_some(),);
             cancel.cancel();
         }
+
+        drop(client);
+        ep.wait_idle().await;
+        server.shutdown().await?;
+
+        Ok(())
+    }
+
+    /// Reports after the first are answered by the kept QAD connection: the
+    /// relay sees one connection, not one a report.
+    #[tokio::test(flavor = "multi_thread")]
+    #[traced_test]
+    async fn test_qad_conn_reused_across_reports() -> Result<()> {
+        let (server, relay) = test_utils::relay().await;
+        let client_config = iroh_relay::tls::make_dangerous_client_config();
+        let ep = noq::Endpoint::client(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 0)).anyerr()?;
+        let quic_addr_disc = QuicConfig {
+            ep: ep.clone(),
+            client_config,
+            ipv4: true,
+            ipv6: false,
+        };
+        let tls_config = CaTlsConfig::insecure_skip_verify()
+            .client_config(default_provider())
+            .expect("infallible");
+        let opts = Options::new(tls_config).quic_config(Some(quic_addr_disc));
+        let mut client = Client::new(
+            DnsResolver::new(),
+            RelayMap::from(relay),
+            opts,
+            Default::default(),
+        );
+        let if_state = IfStateDetails {
+            have_v4: true,
+            have_v6: false,
+        };
+
+        for _ in 0..4 {
+            let cancel = CancellationToken::new();
+            let report = client
+                .get_report(if_state.clone(), false, cancel.child_token())
+                .await;
+            assert!(report.global_v4.is_some(), "expected globalV4 set");
+            cancel.cancel();
+        }
+        assert_eq!(server.metrics().server.qad_incoming.get(), 1);
 
         drop(client);
         ep.wait_idle().await;
